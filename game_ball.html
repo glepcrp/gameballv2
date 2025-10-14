@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>เกมยิงลูกบอล</title>
+  <style>
+    :root {
+      --w: 800px;
+      --h: 600px;
+    }
+    body {
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background: #111;
+      color: #fff;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    }
+    .frame {
+      position: relative;
+      width: var(--w);
+      height: var(--h);
+      background: #000; /* พื้นหลังสีดำ */
+      border: 1px solid #333;
+      user-select: none;
+      -webkit-user-select: none;
+      overflow: hidden;
+    }
+    canvas { display: block; }
+    .hud {
+      position: absolute;
+      top: 8px; right: 8px; /* มุมขวาบน */
+      display: grid;
+      gap: 6px;
+      text-align: right;
+      font-weight: 600;
+      pointer-events: none;
+    }
+    .controls {
+      position: absolute;
+      bottom: 8px; right: 8px; /* มุมขวาล่าง */
+      display: flex; gap: 8px;
+    }
+    .btn {
+      pointer-events: auto;
+      background: #222;
+      color: #fff;
+      border: 1px solid #444;
+      padding: 8px 14px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: transform 120ms ease, background 120ms ease;
+    }
+    .btn:hover { background:#2e2e2e; transform: translateY(-1px); }
+    .legend {
+      position: absolute;
+      left: 8px; top: 8px;
+      font-size: 12px; opacity: .85;
+      line-height: 1.2;
+    }
+  </style>
+</head>
+<body>
+  <div class="frame" id="game-root" aria-label="เกมยิงลูกบอล">
+    <canvas id="game" width="800" height="600" role="img" aria-label="สนามเกม"></canvas>
+
+    <div class="hud" aria-live="polite">
+      <div>เวลา: <span id="time">180</span>s</div>
+      <div>คะแนน: <span id="score">0</span></div>
+    </div>
+
+    <div class="legend">
+      คลิกเมาส์เพื่อยิง | เมาส์เลื่อน = เล็ง | ลูกบอลชนเสาประตูบนสุดเพื่อทำคะแนน
+    </div>
+
+    <div class="controls">
+      <button class="btn" id="btn-start" title="เริ่มเกม">Start</button>
+      <button class="btn" id="btn-reset" title="เริ่มใหม่">Reset</button>
+    </div>
+  </div>
+
+  <script>
+    /**
+     * เกมยิงลูกบอล (HTML + Canvas + Vanilla JS)
+     * รองรับการขยายเป็นหลายลูกบอล/สิ่งกีดขวางในอนาคต
+     */
+
+    // ---------- ค่าคงที่จาก Requirement ----------
+    const WIDTH = 800;
+    const HEIGHT = 600;
+    const BG_COLOR = '#000';
+
+    // Shooter
+    const SHOOTER_COLOR = '#fff';
+    const SHOOTER_W = 80;
+    const SHOOTER_H = 16;
+    const SHOOTER_BOTTOM_OFFSET = 50; // 50px จากขอบล่าง
+
+    // Bullet
+    const BULLET_COLOR = 'yellow';
+    const BULLET_RADIUS = 4;
+    const BULLET_SPEED = 400; // px/sec คงที่ พุ่งขึ้น
+
+    // Ball
+    const BALL_COLOR = 'red';
+    const BALL_RADIUS = 25; // ขนาด 50px
+    const BALL_SPEED_MIN = 2;  // px/sec (ช้ามากตามสเปค)
+    const BALL_SPEED_MAX = 5;  // px/sec
+
+    // พื้นที่การเคลื่อนที่ของลูกบอล: ชิดบน ซ้าย ขวา และอยู่เหนือ shooter 50px
+    // shooter อยู่ที่ y = HEIGHT - SHOOTER_BOTTOM_OFFSET - SHOOTER_H
+    // ดังนั้นขอบล่างของโซนบอล = (shooterY - 50)
+
+    // Goal
+    const GOAL_W = 100;
+    const GOAL_H = 10;
+    const GOAL_COLOR = '#0f0';
+
+    // Scoreboard
+    const GAME_DURATION = 180; // seconds
+
+    // ---------- สถานะเกม ----------
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const timeEl = document.getElementById('time');
+    const scoreEl = document.getElementById('score');
+    const btnStart = document.getElementById('btn-start');
+    const btnReset = document.getElementById('btn-reset');
+    const root = document.getElementById('game-root');
+
+    let mouseX = WIDTH/2;
+
+    const shooterY = HEIGHT - SHOOTER_BOTTOM_OFFSET - SHOOTER_H; // คงที่ตามสเปค
+
+    // โซนสำหรับลูกบอล
+    const ballZone = {
+      left: 0 + BALL_RADIUS,
+      right: WIDTH - BALL_RADIUS,
+      top: 0 + BALL_RADIUS,
+      bottom: (shooterY - 50) - BALL_RADIUS // อยู่เหนือ shooter 50px
+    };
+
+    // ประตู
+    const goal = {
+      x: WIDTH/2 - GOAL_W/2,
+      y: 0, // ด้านบน
+      w: GOAL_W,
+      h: GOAL_H
+    };
+
+    // เอนทิตี
+    class Bullet {
+      constructor(x, y) {
+        this.x = x;
+        this.y = y;
+        this.r = BULLET_RADIUS;
+        this.vx = 0;
+        this.vy = -BULLET_SPEED; // พุ่งขึ้นด้านบน
+        this.active = true;
+      }
+      update(dt) {
+        if (!this.active) return;
+        this.y += this.vy * dt;
+        // ออกจากขอบบนแล้วหายไป
+        if (this.y + this.r < 0) this.active = false;
+      }
+      draw(ctx) {
+        if (!this.active) return;
+        ctx.fillStyle = BULLET_COLOR;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.r, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    class Ball {
+      constructor(x, y, vx, vy) {
+        this.x = x; this.y = y; this.vx = vx; this.vy = vy;
+        this.r = BALL_RADIUS;
+        this.active = true;
+      }
+      update(dt) {
+        if (!this.active) return;
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+        // ชนขอบซ้าย/ขวา
+        if (this.x < ballZone.left) { this.x = ballZone.left; this.vx *= -1; }
+        if (this.x > ballZone.right){ this.x = ballZone.right; this.vx *= -1; }
+        // ชนขอบบน/ล่างของโซนบอล
+        if (this.y < ballZone.top)  { this.y = ballZone.top;  this.vy *= -1; }
+        if (this.y > ballZone.bottom){ this.y = ballZone.bottom; this.vy *= -1; }
+      }
+      draw(ctx) {
+        if (!this.active) return;
+        ctx.fillStyle = BALL_COLOR;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.r, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    // สถานะรวม (รองรับหลายลูกบอลในอนาคต)
+    let bullets = [];
+    let balls = [];
+
+    let score = 0;
+    let timeLeft = GAME_DURATION; // วินาที
+    let running = false;
+    let lastTime = 0;
+    let countdownTimer = null;
+
+    // ---------- ยูทิล ----------
+    function randRange(min, max) { return Math.random() * (max - min) + min; }
+    function randSign() { return Math.random() < 0.5 ? -1 : 1; }
+
+    // สุ่มสร้างลูกบอล 1 ลูกเริ่มต้นที่ "ขอบใดก็ได้" และทิศทางสุ่ม (ตามสเปค)
+    function spawnBall() {
+      // เลือกขอบ: 0=บน,1=ขวา,2=ล่างของโซนบอล,3=ซ้าย
+      const edge = Math.floor(Math.random()*4);
+      let x, y;
+      if (edge === 0) { // บน
+        x = randRange(ballZone.left, ballZone.right);
+        y = ballZone.top;
+      } else if (edge === 1) { // ขวา
+        x = ballZone.right; y = randRange(ballZone.top, ballZone.bottom);
+      } else if (edge === 2) { // ล่าง (ของโซนบอล)
+        x = randRange(ballZone.left, ballZone.right);
+        y = ballZone.bottom;
+      } else { // ซ้าย
+        x = ballZone.left; y = randRange(ballZone.top, ballZone.bottom);
+      }
+      // สุ่มความเร็ว 2-5 px/sec และทิศทางสุ่ม
+      const speed = randRange(BALL_SPEED_MIN, BALL_SPEED_MAX);
+      const angle = randRange(0, Math.PI*2);
+      const vx = Math.cos(angle) * speed;
+      const vy = Math.sin(angle) * speed;
+      balls.push(new Ball(x, y, vx, vy));
+    }
+
+    function resetGame() {
+      score = 0; timeLeft = GAME_DURATION;
+      bullets = [];
+      balls = [];
+      spawnBall();
+      updateHUD();
+      lastTime = performance.now();
+    }
+
+    function startGame() {
+      if (!running) {
+        running = true;
+        lastTime = performance.now();
+        if (!countdownTimer) {
+          countdownTimer = setInterval(() => {
+            if (!running) return;
+            timeLeft = Math.max(0, timeLeft - 1);
+            updateHUD();
+            if (timeLeft === 0) {
+              endGame();
+            }
+          }, 1000);
+        }
+        requestAnimationFrame(loop);
+      }
+    }
+
+    function endGame() {
+      running = false;
+      if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+    }
+
+    function updateHUD() {
+      timeEl.textContent = timeLeft.toString();
+      scoreEl.textContent = score.toString();
+    }
+
+    // ตรวจชนวงกลม-สี่เหลี่ยมอย่างง่าย (ใช้สำหรับชน goal)
+    function circleRectOverlap(cx, cy, cr, rx, ry, rw, rh) {
+      const nearestX = Math.max(rx, Math.min(cx, rx + rw));
+      const nearestY = Math.max(ry, Math.min(cy, ry + rh));
+      const dx = cx - nearestX;
+      const dy = cy - nearestY;
+      return (dx*dx + dy*dy) <= cr*cr;
+    }
+
+    // ตรวจชนวงกลม-วงกลม (bullet vs ball)
+    function circlesCollide(x1, y1, r1, x2, y2, r2) {
+      const dx = x2 - x1, dy = y2 - y1;
+      const r = r1 + r2;
+      return (dx*dx + dy*dy) <= r*r;
+    }
+
+    // อิมแพ็คแบบยืดหยุ่น (Elastic) 2 มิติ สำหรับมวลเท่ากัน: อัปเดตความเร็วของบอลเพียงตัวเดียว
+    function applyElasticImpulseEqualMass({bx, by, bvx, bvy}, {cx, cy, cvx, cvy}) {
+      // bullet: b, ball: c
+      // ใช้สูตรโปรเจ็คชันบนเวกเตอร์ปกติ n = (c - b)
+      const nx = cx - bx;
+      const ny = cy - by;
+      const n2 = nx*nx + ny*ny;
+      if (n2 === 0) return {vx: cvx, vy: cvy}; // ป้องกันหารศูนย์
+
+      // สัมพัทธ์ความเร็ว (v_b - v_c) ฉายบน n
+      const rvx = bvx - cvx;
+      const rvy = bvy - cvy;
+      const dot = (rvx*nx + rvy*ny);
+      // สำหรับมวลเท่ากัน ผลต่างความเร็วตามแกนนอร์มอลจะถูกถ่ายโอนให้บอล
+      const jx = (dot / n2) * nx;
+      const jy = (dot / n2) * ny;
+      const newVx = cvx + 2 * jx; // 2*(องค์ประกอบตามแนวนอร์มอลของ (v_b - v_c))
+      const newVy = cvy + 2 * jy;
+      return {vx: newVx, vy: newVy};
+    }
+
+    // ลูปหลัก
+    function loop(t) {
+      if (!running) return;
+      const dt = Math.min(0.033, (t - lastTime) / 1000); // จำกัด dt สูงสุดเพื่อเสถียรภาพ
+      lastTime = t;
+
+      // อัปเดตเอนทิตี
+      bullets.forEach(b => b.update(dt));
+      balls.forEach(ball => ball.update(dt));
+
+      // ชน bullet กับ ball
+      for (const b of bullets) {
+        if (!b.active) continue;
+        for (const ball of balls) {
+          if (!ball.active) continue;
+          if (circlesCollide(b.x, b.y, b.r, ball.x, ball.y, ball.r)) {
+            // คำนวณความเร็วใหม่ของบอลตามกฎอนุรักษ์โมเมนตัม (มวลเท่ากัน, ชนยืดหยุ่น)
+            const {vx, vy} = applyElasticImpulseEqualMass(
+              {bx: b.x, by: b.y, bvx: b.vx, bvy: b.vy},
+              {cx: ball.x, cy: ball.y, cvx: ball.vx, cvy: ball.vy}
+            );
+            ball.vx = vx; ball.vy = vy;
+            b.active = false; // bullet หายไปหลังชน
+            break;
+          }
+        }
+      }
+
+      // ลบกระสุน/บอลที่ไม่ active
+      bullets = bullets.filter(b => b.active);
+      balls = balls.filter(ball => ball.active);
+
+      // ตรวจชนกับประตู: เมื่อลูกบอลชน goal ให้ +1 และลบแล้ว spawn ใหม่
+      for (const ball of balls) {
+        if (!ball.active) continue;
+        if (circleRectOverlap(ball.x, ball.y, ball.r, goal.x, goal.y, goal.w, goal.h)) {
+          score += 1;
+          ball.active = false;
+          spawnBall();
+          updateHUD();
+        }
+      }
+
+      // วาด
+      render();
+      requestAnimationFrame(loop);
+    }
+
+    function renderShooter(ctx) {
+      // shooter ตามเมาส์ในแนวนอน ตรึงแนวตั้งที่ shooterY
+      const sx = Math.max(0, Math.min(WIDTH - SHOOTER_W, mouseX - SHOOTER_W/2));
+      ctx.fillStyle = SHOOTER_COLOR;
+      ctx.fillRect(sx, shooterY, SHOOTER_W, SHOOTER_H);
+      return {sx, sy: shooterY};
+    }
+
+    function renderGoal(ctx) {
+      ctx.fillStyle = GOAL_COLOR;
+      ctx.fillRect(goal.x, goal.y, goal.w, goal.h);
+    }
+
+    function render() {
+      ctx.clearRect(0,0,WIDTH,HEIGHT);
+      ctx.fillStyle = BG_COLOR;
+      ctx.fillRect(0,0,WIDTH,HEIGHT);
+
+      renderGoal(ctx);
+
+      balls.forEach(ball => ball.draw(ctx));
+      bullets.forEach(b => b.draw(ctx));
+
+      renderShooter(ctx);
+
+      // แสดงโซนล่างของบอลเพื่อความชัดเจน (เส้นขอบจุดประ)
+      ctx.setLineDash([6,6]);
+      ctx.strokeStyle = '#333';
+      ctx.beginPath();
+      ctx.moveTo(0, ballZone.bottom + BALL_RADIUS);
+      ctx.lineTo(WIDTH, ballZone.bottom + BALL_RADIUS);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // ---------- อินพุต ----------
+    root.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      mouseX = e.clientX - rect.left;
+    });
+
+    root.addEventListener('mouseleave', () => {
+      // ไม่ทำอะไรเป็นพิเศษ ปล่อยตำแหน่งเดิม
+    });
+
+    root.addEventListener('mousedown', (e) => {
+      if (!running) return;
+      const shooterTop = shooterY; // ยิงจากขอบบนของสี่เหลี่ยม shooter (กึ่งกลางแนวนอน)
+      const sx = Math.max(0, Math.min(WIDTH - SHOOTER_W, mouseX - SHOOTER_W/2));
+      const bulletX = sx + SHOOTER_W/2;
+      const bulletY = shooterTop;
+      bullets.push(new Bullet(bulletX, bulletY));
+    });
+
+    btnStart.addEventListener('click', () => {
+      // เริ่มเกม: เริ่มจับเวลา/นับคะแนนจาก 0 ตามสเปค
+      if (timeLeft === GAME_DURATION && balls.length === 0) {
+        spawnBall();
+      }
+      startGame();
+    });
+
+    btnReset.addEventListener('click', () => {
+      // เริ่มใหม่ทันที เคลียร์คะแนนเป็น 0 และจับเวลาใหม่
+      endGame();
+      resetGame();
+      startGame();
+    });
+
+    // ---------- บูตเกมครั้งแรก (ยังไม่เริ่มนับเวลา) ----------
+    resetGame();
+    render();
+  </script>
+</body>
+</html>
