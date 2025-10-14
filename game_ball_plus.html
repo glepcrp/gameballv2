@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>เกมยิงลูกบอล – Arcade+ Branch</title>
+  <style>
+    :root{--w:800px;--h:600px}
+    *{box-sizing:border-box}
+    body{margin:0;display:grid;place-items:center;min-height:100dvh;background:#0a0a0a;color:#e9f0ff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+    .frame{position:relative;width:var(--w);height:var(--h);background:#000;border:1px solid #222;border-radius:12px;overflow:hidden}
+    canvas{display:block}
+    .hud{position:absolute;top:8px;right:8px;display:grid;gap:4px;text-align:right;font-weight:700}
+    .legend{position:absolute;left:8px;top:8px;font-size:12px;opacity:.85;line-height:1.3}
+    .controls{position:absolute;right:8px;bottom:8px;display:flex;gap:8px}
+    .btn{background:#1b1f2a;color:#fff;border:1px solid #2c3140;padding:8px 14px;border-radius:10px;font-weight:700;cursor:pointer}
+    .btn:hover{filter:brightness(1.15)}
+    .toast{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 18px;border-radius:12px;background:rgba(9,16,30,.9);border:1px solid #2b3a65;box-shadow:0 8px 40px rgba(0,0,0,.45);display:none}
+    .toast.show{display:block}
+    .stat{display:flex;gap:8px;align-items:center;justify-content:flex-end}
+    .chip{border:1px solid #2b3a65;padding:2px 8px;border-radius:999px;font-size:12px}
+  </style>
+</head>
+<body>
+  <div class="frame" id="root">
+    <canvas id="game" width="800" height="600"></canvas>
+
+    <div class="legend">
+      เมาส์เลื่อน = เล็ง | คลิก = ยิง | ทำประตูให้ครบ 10 ภายใน 180 วิ | ศัตรูบนหัวจะยิงลงมา (โดนทีเดียวแพ้) | ลูกบอลชนไอเท็มเพื่อรับบัฟ
+    </div>
+
+    <div class="hud" aria-live="polite">
+      <div class="stat"><span>เวลา</span><span id="time" class="chip">180s</span></div>
+      <div class="stat"><span>คะแนน</span><span id="score" class="chip">0 / 10</span></div>
+      <div class="stat"><span>พลังชีวิต</span><span id="hp" class="chip">❤</span></div>
+      <div class="stat"><span>บัฟ</span><span id="buffs" class="chip">-</span></div>
+    </div>
+
+    <div class="controls">
+      <button id="start" class="btn">Start</button>
+      <button id="reset" class="btn">Reset</button>
+    </div>
+
+    <div id="toast" class="toast"></div>
+  </div>
+
+  <script>
+  // ===== Arcade+ Branch =====
+  const W=800,H=600; const canvas=document.getElementById('game'); const ctx=canvas.getContext('2d');
+  const timeEl=document.getElementById('time'); const scoreEl=document.getElementById('score');
+  const hpEl=document.getElementById('hp'); const buffsEl=document.getElementById('buffs');
+  const btnStart=document.getElementById('start'); const btnReset=document.getElementById('reset');
+  const toast=document.getElementById('toast'); const root=document.getElementById('root');
+
+  // --- Config ---
+  const GAME_TIME=180; const WIN_SCORE=10;
+  const SHOOTER={w:84,h:16,y:H-50-16,color:'#dfe7ff'}; // ตรึงแนวตั้ง
+  const BULLET={r:4,speed:760,color:'#ffd35a'}; // กระสุนไวขึ้นมาก
+  const BALL={r:25,min:60,max:140,rest:0.86,drag:0.0005,color:'#ff4d4d'}; // px/s random + ลดแรงกระแทก
+  const GOAL={x:W/2-110/2,y:0,w:110,h:12};
+  const BALL_ZONE_BOTTOM=SHOOTER.y-50; // พื้นที่ลูกบอลห้ามต่ำกว่านี้
+  const OBSTACLE_COUNT=4; // สิ่งกีดขวางเพิ่มขึ้น
+  const ENEMY={w:70,h:18,y:24,speed:140,shotCooldown:[900,1500],projSpeed:260};
+  const ITEM={spawnEvery:[12000,18000],r:14,duration:{RAPID:8000,SLOW:5000},life:9000};
+
+  // --- State ---
+  let running=false, lastT=0, timeLeft=GAME_TIME, score=0, hp=1, countdown=null, mouseX=W/2, fireCooldown=0, baseFireCD=180, timeScale=1;
+  const bullets=[]; const balls=[]; const obstacles=[]; const enemyShots=[]; const items=[]; const buffs=new Map();
+
+  // --- Utils ---
+  const rand=(a,b)=>Math.random()*(b-a)+a; const choice=a=>a[Math.floor(Math.random()*a.length)];
+  function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+  function now(){return performance.now()}
+
+  // --- Entities ---
+  class Bullet{constructor(x,y){this.x=x;this.y=y;this.r=BULLET.r;this.vx=0;this.vy=-BULLET.speed;this.active=true}
+    update(dt){this.y+=this.vy*dt*timeScale; if(this.y+this.r<0) this.active=false}
+    draw(){if(!this.active)return; ctx.save(); ctx.shadowColor='#ffd35a'; ctx.shadowBlur=10; ctx.fillStyle=BULLET.color; ctx.beginPath(); ctx.arc(this.x,this.y,this.r,0,Math.PI*2); ctx.fill(); ctx.restore();}
+  }
+
+  class Ball{constructor(x,y,vx,vy){this.x=x;this.y=y;this.vx=vx;this.vy=vy;this.r=BALL.r;this.active=true}
+    update(dt){ if(!this.active)return; // drag เล็กน้อย
+      const speed=Math.hypot(this.vx,this.vy); const drag=1-Math.min(BALL.drag*speed,0.08);
+      this.vx*=drag; this.vy*=drag; this.x+=this.vx*dt*timeScale; this.y+=this.vy*dt*timeScale;
+      // ขอบบน
+      if(this.y-this.r<0){ this.y=this.r; this.vy = -this.vy*BALL.rest; }
+      // ขอบซ้าย/ขวา
+      if(this.x-this.r<0){ this.x=this.r; this.vx = -this.vx*BALL.rest; }
+      if(this.x+this.r>W){ this.x=W-this.r; this.vx = -this.vx*BALL.rest; }
+      // ขอบล่างของโซนบอล
+      if(this.y+this.r>BALL_ZONE_BOTTOM){ this.y=BALL_ZONE_BOTTOM-this.r; this.vy = -this.vy*BALL.rest; }
+      // ชนสิ่งกีดขวางแบบสะท้อน
+      for(const o of obstacles){ if(circleRectOverlap(this.x,this.y,this.r,o.x,o.y,o.w,o.h)) reflectCircleOnRect(this,o); }
+      // ชนประตู
+      if(circleRectOverlap(this.x,this.y,this.r,GOAL.x,GOAL.y,GOAL.w,GOAL.h)) { this.active=false; score++; spawnBall(); updateHUD(); flashToast(`+1 ประตู! (${score}/${WIN_SCORE})`); if(score>=WIN_SCORE) endGame(true); }
+      // ชนไอเท็ม
+      for(const it of items){ if(!it.active) continue; if(circleRectOverlap(this.x,this.y,this.r,it.x-it.r,it.y-it.r,it.r*2,it.r*2)){ it.active=false; applyItem(it.kind); flashToast(buffName(it.kind)); }}
+    }
+    draw(){ if(!this.active) return; const g=ctx.createRadialGradient(this.x-6,this.y-6,6,this.x,this.y,this.r);
+      g.addColorStop(0,'#fff5'); g.addColorStop(.25,'#ffe2'); g.addColorStop(1,'#ff3b3b');
+      ctx.save(); ctx.shadowColor='#ff5b5b'; ctx.shadowBlur=20; ctx.fillStyle=g; ctx.beginPath(); ctx.arc(this.x,this.y,this.r,0,Math.PI*2); ctx.fill(); ctx.restore(); }
+  }
+
+  class Obstacle{constructor(x,y,w,h,dx){this.x=x;this.y=y;this.w=w;this.h=h;this.dx=dx||0}
+    update(dt){ this.x+=this.dx*dt*timeScale; if(this.x<0||this.x+this.w>W){ this.dx*=-1; this.x=clamp(this.x,0,W-this.w);} }
+    draw(){ ctx.save(); const g=ctx.createLinearGradient(this.x,this.y,this.x,this.y+this.h); g.addColorStop(0,'#2dd4bf'); g.addColorStop(1,'#0ea5e9'); ctx.fillStyle=g; ctx.shadowColor='#22d3ee'; ctx.shadowBlur=20; ctx.fillRect(this.x,this.y,this.w,this.h); ctx.restore(); }
+  }
+
+  class Enemy{constructor(){this.x=W/2-ENEMY.w/2; this.y=ENEMY.y; this.w=ENEMY.w; this.h=ENEMY.h; this.vx=ENEMY.speed; this.cooldown=rand(...ENEMY.shotCooldown);} 
+    update(dt){ this.x+=this.vx*dt*timeScale; if(this.x<0||this.x+this.w>W){ this.vx*=-1; this.x=clamp(this.x,0,W-this.w);} this.cooldown-=dt*1000*timeScale; if(this.cooldown<=0){ this.cooldown=rand(...ENEMY.shotCooldown); enemyShots.push(new EnemyShot(this.x+this.w/2,this.y+this.h)); }}
+    draw(){ ctx.save(); ctx.fillStyle='#a78bfa'; ctx.shadowColor='#c084fc'; ctx.shadowBlur=20; roundedRect(ctx,this.x,this.y,this.w,this.h,8); ctx.fill(); ctx.restore(); }
+  }
+
+  class EnemyShot{constructor(x,y){this.x=x;this.y=y;this.w=4;this.h=14;this.active=true}
+    update(dt){ this.y+=ENEMY.projSpeed*dt*timeScale; if(this.y>H) this.active=false; // ชน shooter
+      const sx=clamp(mouseX-SHOOTER.w/2,0,W-SHOOTER.w), sy=SHOOTER.y; if(rectsOverlap(this.x,this.y,this.w,this.h,sx,sy,SHOOTER.w,SHOOTER.h)){ this.active=false; damage(); } }
+    draw(){ ctx.save(); const g=ctx.createLinearGradient(this.x,this.y,this.x,this.y+this.h); g.addColorStop(0,'#f87171'); g.addColorStop(1,'#fb7185'); ctx.fillStyle=g; ctx.shadowColor='#fb7185'; ctx.shadowBlur=12; ctx.fillRect(this.x,this.y,this.w,this.h); ctx.restore(); }
+  }
+
+  class Item{constructor(kind){this.kind=kind; this.r=ITEM.r; this.active=true; this.created=now(); this.x=rand(40,W-40); this.y=rand(60,BALL_ZONE_BOTTOM-40);} 
+    update(){ if(now()-this.created>ITEM.life) this.active=false; }
+    draw(){ if(!this.active) return; drawGem(this.x,this.y,this.r, kindColor(this.kind)); }
+  }
+
+  // --- Collision helpers ---
+  // circle-circle overlap (กระสุนชนลูกบอล)
+  function circlesCollide(x1,y1,r1,x2,y2,r2){ const dx=x2-x1, dy=y2-y1; const rr=r1+r2; return dx*dx+dy*dy <= rr*rr }
+
+  // อิมแพ็คแบบยืดหยุ่นสำหรับมวลเท่ากัน (ใช้เวกเตอร์ปกติจากกระสุนไปหาลูกบอล)
+  function applyElasticImpulseEqualMass(b, c){
+    const nx = c.x - b.x, ny = c.y - b.y; const n2 = nx*nx + ny*ny; if(n2===0) return;
+    const rvx = b.vx - c.vx, rvy = b.vy - c.vy; // v_b - v_c
+    const dot = rvx*nx + rvy*ny; const jx = (dot / n2) * nx; const jy = (dot / n2) * ny;
+    c.vx = c.vx + 2 * jx; c.vy = c.vy + 2 * jy;
+  }
+
+  function circleRectOverlap(cx,cy,cr,rx,ry,rw,rh){ const nx=Math.max(rx,Math.min(cx,rx+rw)); const ny=Math.max(ry,Math.min(cy,ry+rh)); const dx=cx-nx,dy=cy-ny; return dx*dx+dy*dy<=cr*cr }
+  function rectsOverlap(ax,ay,aw,ah,bx,by,bw,bh){ return ax<bx+bw && ax+aw>bx && ay<by+bh && ay+ah>by }
+  function reflectCircleOnRect(c,o){ // ประมาณทิศชนอย่างง่าย
+    const cx=c.x, cy=c.y; const left=Math.abs((o.x)-cx), right=Math.abs((o.x+o.w)-cx), top=Math.abs((o.y)-cy), bottom=Math.abs((o.y+o.h)-cy);
+    const min=Math.min(left,right,top,bottom);
+    if(min===left||min===right){ c.vx = -c.vx*BALL.rest; if(min===left) c.x=o.x-c.r; else c.x=o.x+o.w+c.r; }
+    else{ c.vy = -c.vy*BALL.rest; if(min===top) c.y=o.y-c.r; else c.y=o.y+o.h+c.r; }
+  }
+
+  // --- Drawing helpers ---
+  function roundedRect(ctx,x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+  function drawBG(){ const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#0b1024'); g.addColorStop(1,'#0a172b'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+    // goal glow
+    ctx.save(); ctx.shadowColor='#22c55e'; ctx.shadowBlur=25; ctx.fillStyle='#16a34a'; ctx.fillRect(GOAL.x,GOAL.y,GOAL.w,GOAL.h); ctx.restore();
+    // draw zone line
+    ctx.setLineDash([6,6]); ctx.strokeStyle='#23324e'; ctx.beginPath(); ctx.moveTo(0,BALL_ZONE_BOTTOM); ctx.lineTo(W,BALL_ZONE_BOTTOM); ctx.stroke(); ctx.setLineDash([]);
+  }
+  function drawShooter(){ const sx=clamp(mouseX-SHOOTER.w/2,0,W-SHOOTER.w); ctx.save(); ctx.shadowColor='#7dd3fc'; ctx.shadowBlur=15; const g=ctx.createLinearGradient(sx,SHOOTER.y,sx,SHOOTER.y+SHOOTER.h); g.addColorStop(0,'#e0f2fe'); g.addColorStop(1,'#93c5fd'); ctx.fillStyle=g; roundedRect(ctx,sx,SHOOTER.y,SHOOTER.w,SHOOTER.h,8); ctx.fill(); ctx.restore(); return {sx,sy:SHOOTER.y}; }
+  function drawGem(x,y,r,color){ ctx.save(); ctx.translate(x,y); ctx.rotate(Math.sin(performance.now()/400)*0.08); const g=ctx.createRadialGradient(0,0,3,0,0,r); g.addColorStop(0,'#fff8'); g.addColorStop(.2,'#fff3'); g.addColorStop(1,color); ctx.fillStyle=g; ctx.shadowColor=color; ctx.shadowBlur=18; ctx.beginPath(); for(let i=0;i<6;i++){ const ang=i*Math.PI/3; const px=Math.cos(ang)*r, py=Math.sin(ang)*r; if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);} ctx.closePath(); ctx.fill(); ctx.restore(); }
+  function kindColor(k){ return k==='RAPID'?'#38bdf8':k==='SLOW'?'#f59e0b':'#22c55e' }
+  function buffName(k){ return k==='RAPID'? 'บัฟยิงรัว 8s' : k==='SLOW'? 'สโลว์ทั้งสนาม 5s' : 'เกิดบอลเพิ่ม!'; }
+
+  // --- Items / Buffs ---
+  function applyItem(kind){ if(kind==='RAPID'){ buffs.set('RAPID', now()+ITEM.duration.RAPID); }
+    else if(kind==='SLOW'){ buffs.set('SLOW', now()+ITEM.duration.SLOW); }
+    else if(kind==='MULTI'){ spawnBall(); spawnBall(); }
+    updateBuffFlags(); }
+  function updateBuffFlags(){ const t=now(); let texts=[]; timeScale=1; // reset
+    if(buffs.has('RAPID')){ if(t>buffs.get('RAPID')) buffs.delete('RAPID'); else texts.push('Rapid'); }
+    if(buffs.has('SLOW')){ if(t>buffs.get('SLOW')) buffs.delete('SLOW'); else { timeScale=0.55; texts.push('Slow'); } }
+    buffsEl.textContent = texts.length? texts.join(', ') : '-'; }
+
+  // --- Spawners ---
+  function spawnBall(){ // random edge spawn
+    const edges=['TOP','RIGHT','BOTTOM','LEFT']; const e=choice(edges); let x,y; 
+    if(e==='TOP'){ x=rand(BALL.r,W-BALL.r); y=BALL.r; }
+    else if(e==='RIGHT'){ x=W-BALL.r; y=rand(BALL.r,BALL_ZONE_BOTTOM-BALL.r); }
+    else if(e==='BOTTOM'){ x=rand(BALL.r,W-BALL.r); y=BALL_ZONE_BOTTOM-BALL.r; }
+    else { x=BALL.r; y=rand(BALL.r,BALL_ZONE_BOTTOM-BALL.r); }
+    const sp=rand(BALL.min,BALL.max); const ang=rand(0,Math.PI*2); balls.push(new Ball(x,y,Math.cos(ang)*sp,Math.sin(ang)*sp)); }
+
+  function spawnObstacles(){ obstacles.length=0; const bands=[120, 200, 280, 360]; for(let i=0;i<OBSTACLE_COUNT;i++){ const y=bands[i%bands.length]; const w=rand(80,130), h=16; const x=rand(0,W-w); const dx=(i%2?1:-1)*rand(40,90); obstacles.push(new Obstacle(x,y,w,h,dx)); } }
+
+  let enemy=null; function spawnEnemy(){ enemy=new Enemy(); }
+
+  function scheduleItems(){ // spawn loop using timeouts
+    function once(){ if(!running) return; const kinds=['RAPID','SLOW','MULTI']; items.push(new Item(choice(kinds))); setTimeout(once, rand(...ITEM.spawnEvery)); }
+    setTimeout(once, rand(...ITEM.spawnEvery)); }
+
+  // --- HUD & Game State ---
+  function updateHUD(){ timeEl.textContent = Math.max(0,Math.floor(timeLeft))+'s'; scoreEl.textContent = `${score} / ${WIN_SCORE}`; hpEl.textContent = hp>0?'❤':'✖'; }
+  function flashToast(text){ toast.textContent=text; toast.classList.add('show'); setTimeout(()=>toast.classList.remove('show'), 900); }
+
+  function reset(){ bullets.length=0; balls.length=0; obstacles.length=0; enemyShots.length=0; items.length=0; buffs.clear(); updateBuffFlags();
+    score=0; hp=1; timeLeft=GAME_TIME; fireCooldown=0; timeScale=1; updateHUD(); spawnBall(); spawnObstacles(); spawnEnemy(); draw(); }
+
+  function start(){ if(running) return; running=true; lastT=performance.now(); if(!countdown){ countdown=setInterval(()=>{ if(!running) return; timeLeft-=1; updateBuffFlags(); updateHUD(); if(timeLeft<=0) endGame(false); },1000);} scheduleItems(); requestAnimationFrame(loop); }
+  function endGame(win){ running=false; if(countdown){ clearInterval(countdown); countdown=null; } flashToast(win? '🎉 คุณชนะ! ครบ 10 ประตู' : 'จบเกม!'); }
+
+  // --- Main loop ---
+  function loop(t){ if(!running) return; const dt=Math.min(0.033,(t-lastT)/1000); lastT=t; // update
+    // buffs check
+    updateBuffFlags();
+    // shooting cooldown
+    fireCooldown -= dt*1000*timeScale; const cd = buffs.has('RAPID')? baseFireCD*0.35 : baseFireCD;
+
+    // update entities
+    bullets.forEach(b=>b.update(dt));
+    balls.forEach(b=>b.update(dt));
+    obstacles.forEach(o=>o.update(dt));
+    if(enemy) enemy.update(dt);
+    enemyShots.forEach(s=>s.update(dt));
+    items.forEach(it=>it.update());
+
+    // bullet vs ball collisions (เพิ่มฟิสิกส์ให้เด้งเมื่อโดนยิง)
+    for(const b of bullets){ if(!b.active) continue; for(const c of balls){ if(!c.active) continue; if(circlesCollide(b.x,b.y,b.r,c.x,c.y,c.r)){ applyElasticImpulseEqualMass(b,c); b.active=false; break; } } }
+
+    // cleanup
+    prune(bullets); prune(balls); prune(enemyShots); items.forEach(()=>{}); // items cleaned by active flag
+
+    // render
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  function prune(arr){ for(let i=arr.length-1;i>=0;i--) if(!arr[i].active) arr.splice(i,1); }
+
+  // --- Render ---
+  function draw(){ drawBG(); items.forEach(it=>it.draw()); obstacles.forEach(o=>o.draw()); bullets.forEach(b=>b.draw()); balls.forEach(b=>b.draw()); if(enemy) enemy.draw(); enemyShots.forEach(s=>s.draw()); drawShooter(); }
+
+  // --- Input ---
+  root.addEventListener('mousemove',e=>{ const r=canvas.getBoundingClientRect(); mouseX = e.clientX - r.left; });
+  root.addEventListener('mousedown',()=>{ if(!running) return; const cd = buffs.has('RAPID')? baseFireCD*0.35 : baseFireCD; if(fireCooldown>0) return; fireCooldown=cd; const sx=clamp(mouseX-SHOOTER.w/2,0,W-SHOOTER.w); bullets.push(new Bullet(sx+SHOOTER.w/2, SHOOTER.y)); });
+
+  btnStart.addEventListener('click',()=>{ if(timeLeft===GAME_TIME && balls.length===0) reset(); start(); });
+  btnReset.addEventListener('click',()=>{ endGame(false); reset(); start(); });
+
+  // --- Damage & Lose ---
+  function damage(){ if(hp<=0) return; hp=0; updateHUD(); endGame(false); }
+
+  // --- Boot ---
+  function init(){ reset(); draw(); }
+  function draw(){ // override to include goal and everything
+    // background & goal
+    ctx.clearRect(0,0,W,H); drawBG();
+    // goal label
+    ctx.save(); ctx.fillStyle='#9efcbe'; ctx.font='12px system-ui'; ctx.fillText('GOAL', GOAL.x+GOAL.w/2-14, GOAL.y+GOAL.h+12); ctx.restore();
+    // entities
+    items.forEach(it=>it.draw()); obstacles.forEach(o=>o.draw()); bullets.forEach(b=>b.draw()); balls.forEach(b=>b.draw()); if(enemy) enemy.draw(); enemyShots.forEach(s=>s.draw());
+    // shooter last
+    drawShooter();
+  }
+
+  // --- Start helpers ---
+  init();
+
+  // expose small test hooks (optional)
+  window.__debug={spawnItem:(k)=>items.push(new Item(k||choice(['RAPID','SLOW','MULTI'])))}
+  </script>
+</body>
+</html>
